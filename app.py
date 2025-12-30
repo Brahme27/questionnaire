@@ -2226,12 +2226,13 @@ def render_sidebar():
         st.markdown("## 🏥 Settings")
         st.markdown("---")
         
-        api_key = st.text_input("Gemini API Key", type="password")
+        # Get API key from Streamlit secrets
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
         
         if api_key:
-            st.success("✅ API Key provided")
+            st.success("✅ API Key loaded from secrets")
         else:
-            st.warning("⚠️ Enter API key")
+            st.warning("⚠️ Add GEMINI_API_KEY to Streamlit secrets")
         
         st.markdown("---")
         st.markdown("### 👶 Child Information")
