@@ -539,6 +539,14 @@ def normalize_question_text(question: str) -> str:
     return normalized
 
 
+# Section-specific question counts (Behavioral needs more questions per therapist feedback)
+SECTION_QUESTION_COUNTS = {
+    "Behavioral": 12,  # More questions for behavioral assessment
+    "Cognitive": 10,
+    "Learning Preferences": 8,
+    "Sensory & Physical": 10
+}
+
 def select_age_appropriate_questions_with_ai(api_key: str, child_age: str, all_questions: Dict[str, List[Dict]], num_questions: int = 10) -> Dict[str, List[Dict]]:
     """Use Gemini AI to select age-appropriate questions with variety in types.
     
@@ -547,6 +555,7 @@ def select_age_appropriate_questions_with_ai(api_key: str, child_age: str, all_q
     - Questions come strictly from the source files
     - Each question has a unique identifier
     - RANDOMIZATION: Different questions each session
+    - Section-specific question counts (Behavioral gets more questions)
     """
     try:
         client = genai.Client(api_key=api_key)
@@ -582,8 +591,11 @@ def select_age_appropriate_questions_with_ai(api_key: str, child_age: str, all_q
             # RANDOMIZE: Shuffle available questions before presenting to AI
             random.shuffle(available_questions)
             
+            # Use section-specific question count
+            section_num_questions = SECTION_QUESTION_COUNTS.get(section_name, num_questions)
+            
             questions_list = "\n".join([f"{i+1}. [{q['question_type'].upper()}] {q['question']}" for i, q in enumerate(available_questions)])
-            questions_to_select = min(num_questions, len(available_questions))
+            questions_to_select = min(section_num_questions, len(available_questions))
             
             prompt = f"""You are a pediatric developmental specialist with expertise in child development milestones.
 
@@ -755,6 +767,9 @@ Return JSON array only:"""
             shuffled_questions = questions.copy()
             random.shuffle(shuffled_questions)
             
+            # Use section-specific question count in fallback too
+            section_num_questions = SECTION_QUESTION_COUNTS.get(section, num_questions)
+            
             for q in shuffled_questions:
                 normalized_text = normalize_question_text(q['question'])
                 unique_id = f"{section}:{q['index']}"
@@ -769,7 +784,7 @@ Return JSON array only:"""
                     global_used_questions.add(normalized_text)
                     global_used_indices.add(unique_id)
                     
-                    if len(selected) >= num_questions:
+                    if len(selected) >= section_num_questions:
                         break
             
             # Shuffle final selection order
@@ -855,11 +870,12 @@ def get_question_type_badge(q_type: str) -> str:
 
 def render_likert_question(question: str, key: str) -> Dict:
     """Render a Likert scale question."""
-    response = st.select_slider(
+    response = st.radio(
         "Your response",
         options=list(LIKERT_SCALE.keys()),
-        value="Sometimes",
+        index=2,  # Default to "Sometimes"
         key=key,
+        horizontal=True,
         label_visibility="collapsed"
     )
     return {"response": response, "score": LIKERT_SCALE[response], "response_type": "likert"}
@@ -894,10 +910,43 @@ def render_short_answer_question(question: str, key: str) -> Dict:
     }
 
 
+def get_sentence_word_count_by_age(child_age: str) -> Tuple[int, int]:
+    """Get the required word count range for repeat sentences based on child's age."""
+    age_lower = child_age.lower()
+    
+    # Parse age to determine word count
+    if any(x in age_lower for x in ['1 year', '12 month', '18 month']):
+        return (2, 3)  # 1-2 years: 2-3 words
+    elif any(x in age_lower for x in ['2 year', '24 month']):
+        return (3, 4)  # 2-3 years: 3-4 words (as per therapist feedback)
+    elif any(x in age_lower for x in ['3 year', '36 month']):
+        return (3, 4)  # 3 years: 3-4 words
+    elif any(x in age_lower for x in ['4 year', '48 month']):
+        return (4, 5)  # 4 years: 4-5 words
+    elif any(x in age_lower for x in ['5 year', '60 month']):
+        return (5, 6)  # 5 years: 5-6 words
+    elif any(x in age_lower for x in ['6 year', '72 month']):
+        return (6, 7)  # 6 years: 6-7 words
+    elif any(x in age_lower for x in ['7 year', '84 month']):
+        return (7, 8)  # 7 years: 7-8 words
+    else:
+        # 8+ years
+        return (8, 10)
+
+
+def validate_sentence_word_count(sentence: str, min_words: int, max_words: int) -> bool:
+    """Validate that a sentence has the correct word count."""
+    words = sentence.strip().split()
+    return min_words <= len(words) <= max_words
+
+
 def generate_audio_content_for_child(api_key: str, question: str, child_age: str) -> Dict:
     """Generate age-appropriate audio content for the child based on the question type."""
     try:
         client = genai.Client(api_key=api_key)
+        
+        # Get strict word count requirements based on age
+        min_words, max_words = get_sentence_word_count_by_age(child_age)
         
         # Parse the question to understand what type of audio task it is
         prompt = f"""You are generating age-appropriate audio content for a developmental screening assessment.
@@ -913,38 +962,41 @@ Based on the question, generate specific audio content for the child. The conten
 
 Analyze the task type and generate appropriate content:
 
-**If it's a REPEAT/ECHO task** (child should repeat words/sentences):
-- For 2-3 year olds: Generate 2-4 simple words like "cat, dog, ball" or a short phrase like "big red ball"
-- For 3-4 year olds: Generate a simple sentence like "The cat is sleeping"
-- For 4-5 year olds: Generate a slightly longer sentence like "The happy dog ran to the park"
-- For 5-6 year olds: Generate a complex sentence like "The brown rabbit hopped quickly across the green grass"
-- For 6+ year olds: Generate detailed sentences like "After the rain stopped, the children went outside to play in the puddles"
+**CRITICAL - If it's a REPEAT/ECHO task** (child should repeat words/sentences):
+⚠️ STRICT WORD COUNT REQUIREMENT: Generate EXACTLY {min_words} to {max_words} words for this age group.
+
+Age-specific sentence requirements (MUST FOLLOW STRICTLY):
+- For 1-2 year olds: EXACTLY 2-3 words (e.g., "Big red ball")
+- For 2-3 year olds: EXACTLY 3-4 words (e.g., "The dog runs fast")
+- For 3-4 year olds: EXACTLY 3-4 words (e.g., "Cat drinks milk now")
+- For 4-5 year olds: EXACTLY 4-5 words (e.g., "The bird flies very high")
+- For 5-6 year olds: EXACTLY 5-6 words (e.g., "The happy dog plays outside today")
+- For 6-7 year olds: EXACTLY 6-7 words (e.g., "The little boy ate his lunch quickly")
+- For 7+ year olds: EXACTLY 8-10 words
+
+COUNT YOUR WORDS CAREFULLY! Do not exceed {max_words} words for this {child_age} old child.
 
 **If it's a FOLLOW DIRECTIONS task** (child should do something):
-- Generate 1-3 simple, safe action instructions appropriate for age
-- Example: "Touch your nose, then clap your hands"
+- For under 3 years: 1 simple instruction (e.g., "Clap your hands")
+- For 3-4 years: 1-2 step instructions (e.g., "Touch your nose, then your ears")
+- For 5+ years: 2-3 step instructions
 
 **If it's a LISTENING COMPREHENSION task**:
-- Generate a short story or scenario, then a question about it
-- Keep complexity appropriate for age
+- Generate a short story appropriate for age, then a simple question
 
 **If it's a SOUND/PHONICS task**:
-- Generate sounds, letters, or words to identify
-- Example: "What word starts with the 'B' sound? Ball, Cat, or Dog?"
-
-**If it's a RHYTHM/PATTERN task**:
-- Generate a simple rhythm pattern to copy
-- Example: "Clap, clap, stomp. Now you try!"
+- Generate age-appropriate sounds or words to identify
 
 Respond in this exact JSON format:
 {{
-    "audio_text": "The exact text that will be spoken aloud to the child",
+    "audio_text": "The EXACT text that will be spoken (for repeat tasks: MUST be {min_words}-{max_words} words)",
     "instruction_for_parent": "Brief instruction for parent/assessor about this task",
     "expected_response": "What a successful response looks like",
-    "task_type": "repeat|directions|comprehension|phonics|rhythm|other"
+    "task_type": "repeat|directions|comprehension|phonics|rhythm|other",
+    "word_count": <number of words in audio_text for repeat tasks>
 }}
 
-Generate content that is SPECIFIC and CONCRETE, not generic instructions."""
+IMPORTANT: For repeat tasks, COUNT your words and ensure audio_text has EXACTLY {min_words} to {max_words} words!"""
 
         response = client.models.generate_content(
             model="gemini-2.0-flash",
@@ -961,16 +1013,49 @@ Generate content that is SPECIFIC and CONCRETE, not generic instructions."""
         
         import json
         content = json.loads(response_text)
+        
+        # Validate word count for repeat tasks
+        if content.get('task_type') == 'repeat':
+            audio_text = content.get('audio_text', '')
+            if not validate_sentence_word_count(audio_text, min_words, max_words):
+                # Generate a fallback sentence with correct word count
+                fallback_sentences = {
+                    (2, 3): ["Big red ball", "Cat is soft", "Dog runs fast"],
+                    (3, 4): ["The dog is big", "I like apples", "Bird flies high"],
+                    (4, 5): ["The cat is sleeping now", "I see blue sky", "The ball bounces high"],
+                    (5, 6): ["The happy dog plays outside", "I like to eat apples", "The red bird sings songs"],
+                    (6, 7): ["The little girl plays with dolls", "My cat likes to drink milk", "The boy runs to the park"],
+                    (7, 8): ["The brown dog runs fast in the park", "My little sister likes to play games"],
+                    (8, 10): ["The happy children played with their toys in the sunny garden", "After breakfast the boy went outside to play with friends"]
+                }
+                # Get appropriate fallback
+                fallback_list = fallback_sentences.get((min_words, max_words), ["Hello there"])
+                content['audio_text'] = random.choice(fallback_list)
+                content['word_count'] = len(content['audio_text'].split())
+        
         return content
         
     except Exception as e:
         st.warning(f"Could not generate specific content: {e}")
-        # Fallback to simple content
+        # Fallback to simple content with correct word count
+        min_words, max_words = get_sentence_word_count_by_age(child_age)
+        fallback_sentences = {
+            (2, 3): "Big red ball",
+            (3, 4): "The dog runs",
+            (4, 5): "The cat is soft",
+            (5, 6): "The bird flies very high",
+            (6, 7): "The happy dog plays with ball",
+            (7, 8): "The little boy ate his lunch fast",
+            (8, 10): "The children played happily in the sunny garden today"
+        }
+        fallback_text = fallback_sentences.get((min_words, max_words), "Hello there")
+        
         return {
-            "audio_text": f"Listen carefully: {question}",
+            "audio_text": fallback_text,
             "instruction_for_parent": "Play for child and observe response",
-            "expected_response": "Child attempts to respond appropriately",
-            "task_type": "other"
+            "expected_response": "Child attempts to repeat the sentence",
+            "task_type": "repeat",
+            "word_count": len(fallback_text.split())
         }
 
 
@@ -1064,11 +1149,12 @@ def render_audio_instruction_question(question: str, key: str, api_key: str) -> 
     
     # Rating
     st.write("**📊 Rate the response:**")
-    accuracy = st.select_slider(
+    accuracy = st.radio(
         "How well did the child respond?",
         options=["No response", "Partial/Unclear", "Mostly accurate", "Fully accurate"],
-        value="Mostly accurate" if recorded_audio else "No response",
-        key=f"{key}_rating"
+        index=2 if recorded_audio else 0,  # Default based on whether audio was recorded
+        key=f"{key}_rating",
+        horizontal=True
     )
     
     score_map = {"No response": 0, "Partial/Unclear": 1, "Mostly accurate": 2, "Fully accurate": 3}
@@ -1199,22 +1285,24 @@ def render_motor_task_question(question: str, key: str) -> Dict:
     
     st.info("👀 Observe the child performing this task and rate their ability.")
     
-    response = st.select_slider(
+    response = st.radio(
         "Skill level observed",
         options=list(MOTOR_SKILL_SCALE.keys()),
-        value="Does with minor difficulty",
-        key=key
+        index=3,  # Default to "Does with minor difficulty"
+        key=key,
+        horizontal=True
     )
     
     col1, col2 = st.columns(2)
     with col1:
         attempts = st.number_input("Attempts needed", min_value=1, max_value=10, value=1, key=f"{key}_attempts")
     with col2:
-        consistency = st.select_slider(
+        consistency = st.radio(
             "Consistency",
             options=["Inconsistent", "Variable", "Mostly consistent", "Very consistent"],
-            value="Mostly consistent",
-            key=f"{key}_consistency"
+            index=2,  # Default to "Mostly consistent"
+            key=f"{key}_consistency",
+            horizontal=True
         )
     
     notes = st.text_input(
@@ -1262,13 +1350,42 @@ def render_yes_no_question(question: str, key: str) -> Dict:
 def render_preference_question(question: str, key: str) -> Dict:
     """Render a preference-based question."""
     
+    # Detect learning modality from question
+    question_lower = question.lower()
+    learning_modality = "General"
+    if any(word in question_lower for word in ['listen', 'auditory', 'hear', 'sound', 'verbal', 'spoken']):
+        learning_modality = "Auditory"
+    elif any(word in question_lower for word in ['visual', 'picture', 'see', 'look', 'watch', 'image', 'diagram']):
+        learning_modality = "Visual"
+    elif any(word in question_lower for word in ['hands-on', 'touch', 'move', 'kinesthetic', 'physical', 'activity', 'do']):
+        learning_modality = "Kinesthetic"
+    elif any(word in question_lower for word in ['read', 'write', 'text', 'book', 'reading', 'writing']):
+        learning_modality = "Reading/Writing"
+    
+    modality_colors = {
+        "Auditory": "#e3f2fd",
+        "Visual": "#e8f5e9", 
+        "Kinesthetic": "#fff3e0",
+        "Reading/Writing": "#f3e5f5",
+        "General": "#f5f5f5"
+    }
+    
+    st.markdown(f"""
+    <div style="background-color: {modality_colors.get(learning_modality, '#f5f5f5')}; 
+                padding: 0.5rem 1rem; border-radius: 8px; margin-bottom: 0.5rem;
+                display: inline-block;">
+        <span style="font-weight: 600;">🎯 Learning Style: {learning_modality}</span>
+    </div>
+    """, unsafe_allow_html=True)
+    
     st.info("💡 **Learning Preference**: Rate how strongly this describes the child.")
     
-    response = st.select_slider(
+    response = st.radio(
         "How well does this describe the child?",
         options=["Not at all", "A little", "Somewhat", "Quite a bit", "Very much"],
-        value="Somewhat",
-        key=key
+        index=2,  # Default to "Somewhat"
+        key=key,
+        horizontal=True
     )
     
     score_map = {"Not at all": 0, "A little": 1, "Somewhat": 2, "Quite a bit": 3, "Very much": 4}
@@ -1276,18 +1393,20 @@ def render_preference_question(question: str, key: str) -> Dict:
     return {
         "response": response,
         "score": score_map[response],
-        "response_type": "preference"
+        "response_type": "preference",
+        "learning_modality": learning_modality
     }
 
 
 def render_observation_question(question: str, key: str) -> Dict:
     """Render a general observation question."""
     
-    response = st.select_slider(
+    response = st.radio(
         "Your observation",
         options=list(LIKERT_SCALE.keys()),
-        value="Sometimes",
+        index=2,  # Default to "Sometimes"
         key=key,
+        horizontal=True,
         label_visibility="collapsed"
     )
     
@@ -1623,8 +1742,126 @@ def create_question_type_pie_chart(responses: Dict[str, List[Dict]]) -> go.Figur
     return fig
 
 
+def analyze_learning_preferences(responses: Dict[str, List[Dict]]) -> Dict[str, Dict]:
+    """Analyze learning preferences to identify learning modalities (Auditory, Visual, Kinesthetic, etc.)."""
+    modality_scores = {
+        "Auditory": {"total_score": 0, "max_score": 0, "count": 0, "keywords": ['listen', 'auditory', 'hear', 'sound', 'verbal', 'spoken', 'music', 'rhythm']},
+        "Visual": {"total_score": 0, "max_score": 0, "count": 0, "keywords": ['visual', 'picture', 'see', 'look', 'watch', 'image', 'diagram', 'color', 'read']},
+        "Kinesthetic": {"total_score": 0, "max_score": 0, "count": 0, "keywords": ['hands-on', 'touch', 'move', 'kinesthetic', 'physical', 'activity', 'do', 'manipulate', 'build']},
+        "Reading/Writing": {"total_score": 0, "max_score": 0, "count": 0, "keywords": ['read', 'write', 'text', 'book', 'story', 'letter', 'word']}
+    }
+    
+    # Get Learning Preferences section
+    learning_responses = responses.get("Learning Preferences", [])
+    
+    for resp in learning_responses:
+        question = resp.get('question', '').lower()
+        score = resp.get('score', 0)
+        
+        # Determine which modality this question relates to
+        for modality, data in modality_scores.items():
+            if any(keyword in question for keyword in data['keywords']):
+                data['total_score'] += score
+                data['max_score'] += 4  # Max score for preference questions
+                data['count'] += 1
+                break
+        else:
+            # If no specific modality found, check if response has learning_modality
+            if resp.get('learning_modality') and resp.get('learning_modality') != "General":
+                modality = resp.get('learning_modality')
+                if modality in modality_scores:
+                    modality_scores[modality]['total_score'] += score
+                    modality_scores[modality]['max_score'] += 4
+                    modality_scores[modality]['count'] += 1
+    
+    # Calculate percentages
+    result = {}
+    for modality, data in modality_scores.items():
+        if data['count'] > 0:
+            percentage = (data['total_score'] / data['max_score'] * 100) if data['max_score'] > 0 else 0
+            result[modality] = {
+                'percentage': round(percentage, 1),
+                'score': data['total_score'],
+                'max_score': data['max_score'],
+                'count': data['count']
+            }
+    
+    return result
+
+
+def create_learning_preferences_chart(responses: Dict[str, List[Dict]]) -> go.Figure:
+    """Create a chart showing learning style preferences breakdown."""
+    modality_data = analyze_learning_preferences(responses)
+    
+    if not modality_data:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No learning preference data available",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="#718096")
+        )
+        fig.update_layout(
+            height=250,
+            title=dict(text="Learning Style Preferences", font=dict(size=16), x=0.5)
+        )
+        return fig
+    
+    modalities = list(modality_data.keys())
+    percentages = [modality_data[m]['percentage'] for m in modalities]
+    counts = [modality_data[m]['count'] for m in modalities]
+    
+    # Colors for each modality
+    modality_colors = {
+        "Auditory": "#3182ce",  # Blue
+        "Visual": "#38a169",    # Green
+        "Kinesthetic": "#dd6b20", # Orange
+        "Reading/Writing": "#805ad5"  # Purple
+    }
+    colors = [modality_colors.get(m, "#718096") for m in modalities]
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=modalities,
+        y=percentages,
+        marker_color=colors,
+        text=[f'{p:.0f}%' for p in percentages],
+        textposition='outside',
+        textfont=dict(size=12, weight='bold'),
+        hovertemplate='<b>%{x}</b><br>Score: %{y:.1f}%<br>Items: %{customdata}<extra></extra>',
+        customdata=counts
+    ))
+    
+    fig.update_layout(
+        title=dict(
+            text="Learning Style Preferences",
+            font=dict(size=16),
+            x=0.5
+        ),
+        xaxis=dict(title="Learning Modality"),
+        yaxis=dict(title="Preference Score", range=[0, 110], ticksuffix='%'),
+        height=300,
+        margin=dict(l=60, r=40, t=60, b=60),
+        showlegend=False
+    )
+    
+    # Add icons/emojis as annotations
+    icons = {"Auditory": "🎧", "Visual": "👁️", "Kinesthetic": "🤸", "Reading/Writing": "📖"}
+    for i, modality in enumerate(modalities):
+        fig.add_annotation(
+            x=modality,
+            y=percentages[i] + 8,
+            text=icons.get(modality, "📊"),
+            showarrow=False,
+            font=dict(size=16)
+        )
+    
+    return fig
+
+
 def create_clinical_flags_chart(tag_analysis: Dict[str, Dict]) -> go.Figure:
-    """Create a chart showing clinical indicator flags."""
+    """Create a chart showing clinical indicator flags with percentage-based comparison."""
     # Filter for significant tags
     significant_tags = {
         tag: data for tag, data in tag_analysis.items()
@@ -1649,39 +1886,50 @@ def create_clinical_flags_chart(tag_analysis: Dict[str, Dict]) -> go.Figure:
     tags = list(significant_tags.keys())
     high_counts = [significant_tags[t]['high_scores'] for t in tags]
     total_counts = [significant_tags[t]['total'] for t in tags]
+    # Calculate percentages for better comparison
+    percentages = [(h / t * 100) if t > 0 else 0 for h, t in zip(high_counts, total_counts)]
+    
+    # Color based on severity percentage
+    colors = []
+    for p in percentages:
+        if p >= 75:
+            colors.append('#c53030')  # Dark red - significant
+        elif p >= 50:
+            colors.append('#f56565')  # Light red - moderate
+        elif p >= 25:
+            colors.append('#ed8936')  # Orange - mild concern
+        else:
+            colors.append('#ecc94b')  # Yellow - monitor
     
     fig = go.Figure()
     
+    # Use grouped bar chart for clearer comparison
     fig.add_trace(go.Bar(
-        name='High Scores',
+        name='High Score %',
         x=tags,
-        y=high_counts,
-        marker_color='#f56565',
-        text=high_counts,
-        textposition='auto'
+        y=percentages,
+        marker_color=colors,
+        text=[f'{p:.0f}%<br>({h}/{t})' for p, h, t in zip(percentages, high_counts, total_counts)],
+        textposition='outside',
+        textfont=dict(size=11)
     ))
     
-    fig.add_trace(go.Bar(
-        name='Total Items',
-        x=tags,
-        y=[t - h for t, h in zip(total_counts, high_counts)],
-        marker_color='#a0aec0',
-        text=[f'/{t}' for t in total_counts],
-        textposition='auto'
-    ))
+    # Add threshold line at 50%
+    fig.add_hline(y=50, line_dash="dash", line_color="#718096", 
+                  annotation_text="Concern Threshold (50%)", 
+                  annotation_position="top right")
     
     fig.update_layout(
-        barmode='stack',
         title=dict(
-            text="Clinical Indicator Analysis",
+            text="Clinical Indicator Analysis (% of High Scores)",
             font=dict(size=16),
             x=0.5
         ),
-        yaxis=dict(title="Item Count"),
-        xaxis=dict(title=""),
-        height=300,
+        yaxis=dict(title="Percentage of High Scores", range=[0, 110], ticksuffix='%'),
+        xaxis=dict(title="Clinical Indicator"),
+        height=350,
         margin=dict(l=60, r=40, t=60, b=80),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        showlegend=False
     )
     
     return fig
@@ -1836,7 +2084,18 @@ def render_visual_report(child_name: str, child_age: str, all_responses: Dict[st
         pie_chart = create_question_type_pie_chart(all_responses)
         st.plotly_chart(pie_chart, width='stretch')
     
-    # Row 3: Clinical flags
+    # Row 3: Learning Preferences breakdown (Auditory, Visual, Kinesthetic)
+    st.markdown("#### 📚 Learning Style Breakdown")
+    learning_prefs_chart = create_learning_preferences_chart(all_responses)
+    st.plotly_chart(learning_prefs_chart, use_container_width=True)
+    
+    # Show learning style summary
+    modality_data = analyze_learning_preferences(all_responses)
+    if modality_data:
+        dominant_style = max(modality_data.items(), key=lambda x: x[1]['percentage'])
+        st.info(f"🎯 **Dominant Learning Style:** {dominant_style[0]} ({dominant_style[1]['percentage']:.0f}%) - Consider incorporating {dominant_style[0].lower()} activities in learning sessions.")
+    
+    # Row 4: Clinical flags
     if tag_analysis:
         flags_chart = create_clinical_flags_chart(tag_analysis)
         st.plotly_chart(flags_chart, width='stretch')
@@ -1892,12 +2151,30 @@ def render_visual_report(child_name: str, child_age: str, all_responses: Dict[st
         for tag, data in significant_flags.items():
             severity = "🔴 Significant" if data['high_scores'] >= 3 else "🟡 Moderate" if data['high_scores'] >= 2 else "🟢 Mild"
             
+            # Improved visibility with darker text colors
+            if data['high_scores'] >= 3:
+                bg_color = '#fed7d7'
+                border_color = '#c53030'
+                text_color = '#742a2a'
+                label_color = '#9b2c2c'
+            elif data['high_scores'] >= 2:
+                bg_color = '#fefcbf'
+                border_color = '#d69e2e'
+                text_color = '#744210'
+                label_color = '#975a16'
+            else:
+                bg_color = '#c6f6d5'
+                border_color = '#38a169'
+                text_color = '#22543d'
+                label_color = '#276749'
+            
             st.markdown(f"""
-            <div style="background: {'#fed7d7' if data['high_scores'] >= 3 else '#fefcbf' if data['high_scores'] >= 2 else '#c6f6d5'}; 
+            <div style="background: {bg_color}; 
                         padding: 1rem; border-radius: 8px; margin-bottom: 0.5rem;
-                        border-left: 4px solid {'#c53030' if data['high_scores'] >= 3 else '#d69e2e' if data['high_scores'] >= 2 else '#38a169'};">
-                <strong>{tag}</strong> - {severity}<br>
-                <small>{data['high_scores']} of {data['total']} items scored HIGH | Sections: {', '.join(data['sections'])}</small>
+                        border-left: 4px solid {border_color};">
+                <div style="color: {text_color}; font-weight: bold; font-size: 1.1rem; margin-bottom: 0.3rem;">{tag}</div>
+                <div style="color: {label_color}; font-weight: 600; margin-bottom: 0.3rem;">{severity}</div>
+                <div style="color: {text_color}; font-size: 0.9rem;">{data['high_scores']} of {data['total']} items scored HIGH | Sections: {', '.join(data['sections'])}</div>
             </div>
             """, unsafe_allow_html=True)
     else:
