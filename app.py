@@ -59,6 +59,11 @@ st.markdown("""
         border-radius: 8px;
         border-left: 4px solid #c2185b;
         margin: 0.5rem 0;
+        color: #880e4f;
+    }
+    
+    .motor-task strong {
+        color: #c2185b;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -342,25 +347,93 @@ Return ONLY the JSON, no other text."""
             }
 
 
-def generate_image_for_question(api_key: str, question: str) -> Optional[dict]:
-    """Generate an actual image using Gemini's image generation capability."""
+def generate_image_for_question(api_key: str, question: str, child_age: str = "4-5 years") -> Optional[dict]:
+    """Generate a task-specific image using AI with clear expected answers.
+    
+    This function:
+    1. Analyzes the question to understand what visual task is needed
+    2. Creates a specific image prompt with hidden/identifiable elements
+    3. Generates the image
+    4. Provides the exact answer the child should give
+    
+    Handles exact questions from Excel files like:
+    - "Look at the picture. Where is the ball hidden?"
+    - "Look at the picture. Where is the toy car hidden?"
+    - "Look at the picture. What color is the toy car?"
+    - "Identify the shapes in the image."
+    """
     errors = []
     
     try:
         client = genai.Client(api_key=api_key)
         
-        # Create a child-appropriate image prompt
-        image_prompt = f"""Create a simple, colorful, child-friendly cartoon illustration for a developmental assessment.
+        # First, use AI to analyze the question and create a specific visual task
+        task_analysis_prompt = f"""You are creating a visual task for a child developmental assessment.
 
-Question context: "{question}"
+Question from assessment: "{question}"
+Child's age: {child_age}
 
-Requirements:
-- Simple cartoon style with bright colors
-- Clear, easy to understand for children aged 2-7 years
-- Educational and engaging
+Analyze this question and create a SPECIFIC visual task. Return JSON:
+{{
+    "task_type": "hidden_object" | "identification" | "counting" | "color_identification" | "shape_identification" | "pointing",
+    "scene_description": "A detailed description of what the image should show",
+    "main_subject": "The specific item/object the child needs to find or identify",
+    "location_hint": "Where the main subject is located in the scene (if hidden object task)",
+    "correct_answer": "The exact answer the child should give",
+    "image_prompt": "A detailed prompt to generate this specific image for children",
+    "assessor_instruction": "What the assessor should ask the child"
+}}
+
+Examples based on EXACT questions from the assessment:
+- "Look at the picture. Where is the ball hidden?" → hidden_object task, ball partially hidden behind furniture, answer: "behind the couch"
+- "Look at the picture. Where is the toy car hidden?" → hidden_object task, toy car partially visible under table, answer: "under the table"  
+- "Look at the picture. What color is the toy car?" → color_identification task, colorful scene with one toy car, answer: "red" (or specific color)
+- "Identify the shapes in the image." → shape_identification task, various shapes displayed, answer: "circle, square, triangle"
+- "Look at the picture. Where is the small green ball?" → hidden_object with color, green ball in specific location
+- "Look at the picture. Which item is missing from the desk?" → identification task comparing items
+
+Make the task age-appropriate for {child_age}. Return ONLY valid JSON."""
+
+        try:
+            task_response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=task_analysis_prompt
+            )
+            
+            task_json = task_response.text
+            # Clean JSON response
+            if "```" in task_json:
+                task_json = task_json.split("```")[1]
+                if task_json.startswith("json"):
+                    task_json = task_json[4:]
+                task_json = task_json.split("```")[0]
+            
+            task_info = json.loads(task_json.strip())
+        except Exception as parse_err:
+            # Default task info if parsing fails
+            task_info = {
+                "task_type": "identification",
+                "scene_description": f"A colorful scene related to: {question}",
+                "main_subject": "the object mentioned in the question",
+                "correct_answer": "Identify the item shown",
+                "image_prompt": f"Simple colorful cartoon illustration for children, {question}",
+                "assessor_instruction": question
+            }
+        
+        # Create a specific image prompt based on task analysis
+        image_prompt = f"""Create a simple, colorful, child-friendly cartoon illustration.
+
+Scene: {task_info.get('scene_description', question)}
+
+IMPORTANT Requirements:
+- Simple cartoon style with bright, cheerful colors
+- Age-appropriate for {child_age}
+- The main subject ({task_info.get('main_subject', 'item')}) must be clearly visible but appropriately placed
+- {"The item should be partially hidden at: " + task_info.get('location_hint', 'somewhere in the scene') if task_info.get('task_type') == 'hidden_object' else 'The item should be clearly identifiable'}
+- No text or words in the image
+- Clean, uncluttered background
 - Safe and appropriate for young children
-- Single clear subject or scene
-- No text or words in the image"""
+- Educational and engaging"""
         
         # Method 1: Try Imagen 3.0 generate-002 (latest version)
         try:
@@ -381,14 +454,12 @@ Requirements:
                 image_bytes = response.generated_images[0].image.image_bytes
                 image_base64 = base64.b64encode(image_bytes).decode()
                 
-                desc_response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=f"For this question: '{question}', what should the child identify? Brief answer."
-                )
-                
                 return {
                     "image_base64": image_base64,
-                    "correct_answer": desc_response.text if desc_response else "Identify the item"
+                    "correct_answer": task_info.get('correct_answer', 'Identify the item'),
+                    "task_type": task_info.get('task_type', 'identification'),
+                    "assessor_instruction": task_info.get('assessor_instruction', question),
+                    "main_subject": task_info.get('main_subject', 'the object')
                 }
         except Exception as e1:
             errors.append(f"Imagen-3.0-002: {str(e1)}")
@@ -405,7 +476,6 @@ Requirements:
                 )
             )
             
-            # Check for image in response parts
             if response.candidates and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
                     if hasattr(part, 'inline_data') and part.inline_data:
@@ -417,7 +487,10 @@ Requirements:
                         
                         return {
                             "image_base64": image_base64,
-                            "correct_answer": "Identify what you see in the image"
+                            "correct_answer": task_info.get('correct_answer', 'Identify what you see'),
+                            "task_type": task_info.get('task_type', 'identification'),
+                            "assessor_instruction": task_info.get('assessor_instruction', question),
+                            "main_subject": task_info.get('main_subject', 'the object')
                         }
         except Exception as e2:
             errors.append(f"Gemini-2.0-flash-exp: {str(e2)}")
@@ -441,56 +514,50 @@ Requirements:
                 
                 return {
                     "image_base64": image_base64,
-                    "correct_answer": "Identify what you see in the image"
+                    "correct_answer": task_info.get('correct_answer', 'Identify what you see'),
+                    "task_type": task_info.get('task_type', 'identification'),
+                    "assessor_instruction": task_info.get('assessor_instruction', question),
+                    "main_subject": task_info.get('main_subject', 'the object')
                 }
         except Exception as e3:
             errors.append(f"imagegeneration@006: {str(e3)}")
         
         # Method 4: Use free Pollinations.ai API as fallback
         try:
-            # Create a simpler prompt for the free API
-            simple_prompt = f"simple colorful cartoon for children, {question}, educational, cute, bright colors, no text"
+            simple_prompt = task_info.get('image_prompt', f"simple colorful cartoon for children, {question}, educational, cute, bright colors, no text")
             encoded_prompt = urllib.parse.quote(simple_prompt)
             
-            # Pollinations.ai free image API - smaller size for faster loading
             image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=300&height=300&nologo=true"
             
-            # Download the image using requests
             response = requests.get(image_url, timeout=60)
             if response.status_code == 200:
                 image_bytes = response.content
                 image_base64 = base64.b64encode(image_bytes).decode()
                 
-                # Get description using Gemini
-                client = genai.Client(api_key=api_key)
-                desc_response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=f"For this question: '{question}', what should the child identify? Give a brief 5-10 word answer."
-                )
-                
                 return {
                     "image_base64": image_base64,
-                    "correct_answer": desc_response.text if desc_response else "Identify what you see"
+                    "correct_answer": task_info.get('correct_answer', 'Identify what you see'),
+                    "task_type": task_info.get('task_type', 'identification'),
+                    "assessor_instruction": task_info.get('assessor_instruction', question),
+                    "main_subject": task_info.get('main_subject', 'the object')
                 }
             else:
                 errors.append(f"Pollinations.ai: HTTP {response.status_code}")
         except Exception as e4:
             errors.append(f"Pollinations.ai: {str(e4)}")
         
-        # Log all errors for debugging
         if errors:
             st.warning(f"Image generation attempts: {'; '.join(errors)}")
         
         return None
         
     except Exception as e:
-        # Fallback to text description if image generation fails
         try:
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=f"""Create a simple visual scenario description for: "{question}"
-                Return JSON: {{"scene_description": "what to draw/show", "correct_answer": "what child should identify"}}
+                Return JSON: {{"scene_description": "what to draw/show", "correct_answer": "what child should identify", "assessor_instruction": "what to ask the child"}}
                 Return ONLY JSON."""
             )
             return {"text_fallback": response.text, "error": str(e)}
@@ -873,17 +940,207 @@ def render_likert_question(question: str, key: str) -> Dict:
     response = st.radio(
         "Your response",
         options=list(LIKERT_SCALE.keys()),
-        index=2,  # Default to "Sometimes"
+        index=None,  # No default selection - user must choose
         key=key,
         horizontal=True,
         label_visibility="collapsed"
     )
+    # Handle None response (not yet answered)
+    if response is None:
+        return {"response": None, "score": None, "response_type": "likert"}
     return {"response": response, "score": LIKERT_SCALE[response], "response_type": "likert"}
 
 
-def render_short_answer_question(question: str, key: str) -> Dict:
-    """Render a short answer question."""
-    st.info("💡 **Comprehension Task**: Ask the child this question and record their response.")
+def generate_story_for_comprehension(api_key: str, question: str, child_age: str) -> Dict:
+    """Generate an age-appropriate story that matches the comprehension question exactly.
+    
+    Stories are generated to match the EXACT questions from the Excel files:
+    1. "(a) Where did the character go on their trip? (b) What did they see there?"
+    2. "(a) Where did the character go? (b) What did they find?"
+    3. "What did the character find in the story?"
+    """
+    try:
+        client = genai.Client(api_key=api_key)
+        
+        question_lower = question.lower()
+        
+        # Determine what the story needs to contain based on the exact question
+        if "trip" in question_lower and "see there" in question_lower:
+            # Question: "(a) Where did the character go on their trip? (b) What did they see there?"
+            story_requirements = """
+The story MUST clearly include:
+1. A character with a name (like Sam, Lily, Max, etc.)
+2. The character goes on a TRIP to a specific place (beach, farm, zoo, park, etc.)
+3. The character SEES something specific there (animals, flowers, waves, etc.)
+
+The questions will be:
+(a) Where did the character go on their trip? 
+(b) What did they see there?
+
+Make sure the answers are VERY CLEAR in the story."""
+
+        elif "where did the character go" in question_lower and "what did they find" in question_lower:
+            # Question: "(a) Where did the character go? (b) What did they find?"
+            story_requirements = """
+The story MUST clearly include:
+1. A character with a name (like Sam, Lily, Max, etc.)
+2. The character goes to a specific place (garden, forest, house, store, etc.)
+3. The character FINDS something specific there (a toy, a flower, a puppy, a coin, etc.)
+
+The questions will be:
+(a) Where did the character go?
+(b) What did they find?
+
+Make sure the answers are VERY CLEAR in the story."""
+
+        elif "what did the character find in the story" in question_lower:
+            # Question: "What did the character find in the story?"
+            story_requirements = """
+The story MUST clearly include:
+1. A character with a name (like Sam, Lily, Max, etc.)
+2. The character FINDS something important (a treasure, a lost item, a new friend, etc.)
+
+The question will be:
+What did the character find in the story?
+
+Make sure the answer is VERY CLEAR and easy to identify in the story."""
+
+        else:
+            # Generic comprehension story
+            story_requirements = """
+The story should have:
+1. A clear character with a name
+2. A simple plot with a beginning, middle, and end
+3. Clear details that can be asked about"""
+
+        prompt = f"""Generate a SHORT, age-appropriate story for a {child_age} old child.
+
+{story_requirements}
+
+IMPORTANT GUIDELINES:
+- For toddlers (1-3 years): 2-3 very simple sentences, basic words
+- For preschoolers (3-5 years): 3-4 simple sentences
+- For school age (5-7 years): 4-6 sentences with slightly more detail
+- For older children (7+ years): 5-8 sentences
+
+The story should be:
+- Fun and engaging
+- Easy to understand
+- Have CLEAR answers to the comprehension questions
+
+Return JSON format ONLY:
+{{
+    "story_title": "A short title for the story",
+    "story_text": "The full story text to read to the child",
+    "correct_answers": {{
+        "where_did_go": "The place the character went (if applicable)",
+        "what_did_find": "What the character found (if applicable)",
+        "what_did_see": "What the character saw (if applicable)"
+    }},
+    "character_name": "The name of the main character"
+}}
+
+Return ONLY the JSON, no other text."""
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        
+        response_text = response.text.strip()
+        
+        # Parse JSON
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        response_text = response_text.strip()
+        
+        return json.loads(response_text)
+        
+    except Exception as e:
+        # Fallback stories based on question type
+        if "trip" in question.lower() and "see" in question.lower():
+            return {
+                "story_title": "Sam's Trip to the Beach",
+                "story_text": "Sam went on a trip to the beach. At the beach, Sam saw big waves and colorful seashells. Sam had a fun day!",
+                "correct_answers": {
+                    "where_did_go": "the beach",
+                    "what_did_see": "big waves and colorful seashells"
+                },
+                "character_name": "Sam"
+            }
+        elif "find" in question.lower():
+            return {
+                "story_title": "Lily's Garden Adventure",
+                "story_text": "Lily went to the garden. She looked under the big tree. Lily found a pretty red flower! She was very happy.",
+                "correct_answers": {
+                    "where_did_go": "the garden",
+                    "what_did_find": "a pretty red flower"
+                },
+                "character_name": "Lily"
+            }
+        else:
+            return {
+                "story_title": "Max's Day",
+                "story_text": "Max went to the park. He played on the swings. Max found a shiny coin on the ground!",
+                "correct_answers": {
+                    "where_did_go": "the park",
+                    "what_did_find": "a shiny coin"
+                },
+                "character_name": "Max"
+            }
+
+
+def render_short_answer_question(question: str, key: str, api_key: str = None) -> Dict:
+    """Render a short answer question with story generation for comprehension questions."""
+    
+    question_lower = question.lower()
+    
+    # Check if this is a comprehension question that needs a story
+    needs_story = any([
+        "character" in question_lower and "where" in question_lower,
+        "character" in question_lower and "find" in question_lower,
+        "character" in question_lower and "see" in question_lower,
+        "character" in question_lower and "story" in question_lower,
+    ])
+    
+    story_data = None
+    
+    if needs_story and api_key:
+        # Generate or retrieve cached story
+        story_cache_key = f"{key}_story"
+        
+        if story_cache_key not in st.session_state:
+            child_age = st.session_state.get('child_age_for_questions', '4 years')
+            with st.spinner("📖 Generating age-appropriate story..."):
+                st.session_state[story_cache_key] = generate_story_for_comprehension(api_key, question, child_age)
+        
+        story_data = st.session_state.get(story_cache_key)
+        
+        if story_data:
+            # Display the story prominently
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #e8f4fd 0%, #d1e8ff 100%); 
+                        padding: 1.5rem; border-radius: 12px; margin-bottom: 1rem;
+                        border-left: 5px solid #3182ce;">
+                <h4 style="color: #2c5282; margin: 0 0 0.5rem 0;">📖 {story_data.get('story_title', 'Story')}</h4>
+                <p style="color: #2d3748; font-size: 1.1rem; line-height: 1.6; margin: 0;">
+                    {story_data.get('story_text', '')}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Add audio option to read the story
+            if st.button("🔊 Read Story Aloud", key=f"{key}_read_story"):
+                story_audio = generate_audio_for_question(story_data.get('story_text', ''))
+                if story_audio:
+                    st.audio(f"data:audio/mp3;base64,{story_audio}", format="audio/mp3")
+            
+            st.markdown("---")
+            st.info(f"💡 **Now ask the child:** {question}")
+    else:
+        st.info("💡 **Comprehension Task**: Ask the child this question and record their response.")
     
     response = st.text_area(
         "Child's response",
@@ -892,22 +1149,41 @@ def render_short_answer_question(question: str, key: str) -> Dict:
         height=100
     )
     
+    # Show expected answers hint (for assessor only)
+    if story_data and story_data.get('correct_answers'):
+        with st.expander("👁️ Expected Answers (for assessor reference)"):
+            answers = story_data.get('correct_answers', {})
+            if answers.get('where_did_go'):
+                st.write(f"**Where did the character go?** {answers['where_did_go']}")
+            if answers.get('what_did_find'):
+                st.write(f"**What did they find?** {answers['what_did_find']}")
+            if answers.get('what_did_see'):
+                st.write(f"**What did they see?** {answers['what_did_see']}")
+    
     # Rate the response quality
     quality = st.radio(
         "Response quality:",
         options=["No response", "Unclear/Off-topic", "Partially correct", "Correct"],
+        index=None,  # No default selection - user must choose
         key=f"{key}_quality",
         horizontal=True
     )
     
     score_map = {"No response": 0, "Unclear/Off-topic": 1, "Partially correct": 2, "Correct": 3}
     
-    return {
+    result = {
         "response": response,
         "quality": quality,
-        "score": score_map[quality],
+        "score": score_map.get(quality) if quality else None,
         "response_type": "short_answer"
     }
+    
+    # Include story data in response for assessment report
+    if story_data:
+        result["story_shown"] = story_data.get('story_text', '')
+        result["expected_answers"] = story_data.get('correct_answers', {})
+    
+    return result
 
 
 def get_sentence_word_count_by_age(child_age: str) -> Tuple[int, int]:
@@ -1060,217 +1336,339 @@ IMPORTANT: For repeat tasks, COUNT your words and ensure audio_text has EXACTLY 
 
 
 def render_audio_instruction_question(question: str, key: str, api_key: str) -> Dict:
-    """Render an audio instruction question with playback and child recording."""
+    """Render a simple audio task: Play audio → Child repeats → Record → AI analyzes."""
     
-    st.info("🎧 **Audio Task**: Play the audio for the child to listen, then record their response.")
+    st.info("🎧 **Audio Task**: Play the audio, let the child listen and repeat, then record their response.")
     
-    # Generate age-appropriate audio content (not just the question text)
+    # Generate simple audio for the child to repeat
     child_age = st.session_state.get('child_age_for_questions', '4 years')
     
+    # Get appropriate sentence based on age
+    min_words, max_words = get_sentence_word_count_by_age(child_age)
+    
     if key not in st.session_state.audio_cache:
-        with st.spinner("🤖 Generating age-appropriate audio content..."):
-            # Generate specific content for the child
-            audio_content = generate_audio_content_for_child(api_key, question, child_age)
-            
-            if audio_content:
-                # Generate the actual audio from the specific text
-                audio_text = audio_content.get("audio_text", question)
-                audio_base64 = generate_audio_for_question(audio_text)
+        with st.spinner("🔊 Generating audio..."):
+            # Generate a simple sentence for the child to repeat
+            try:
+                client = genai.Client(api_key=api_key)
+                prompt = f"""Generate ONE simple sentence for a {child_age} old child to repeat.
+
+Requirements:
+- Must have exactly {min_words} to {max_words} words
+- Use simple, common words a child would know
+- Make it fun and engaging
+- Examples: "The cat is sleeping", "I like red apples", "The dog runs fast"
+
+Return ONLY the sentence, nothing else."""
                 
-                if audio_base64:
-                    st.session_state.audio_cache[key] = {
-                        "audio_base64": audio_base64,
-                        "audio_text": audio_text,
-                        "instruction_for_parent": audio_content.get("instruction_for_parent", "Play for child"),
-                        "expected_response": audio_content.get("expected_response", "Listen for child's response")
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt
+                )
+                sentence = response.text.strip().strip('"').strip("'")
+                
+                # Validate word count
+                if not validate_sentence_word_count(sentence, min_words, max_words):
+                    # Fallback sentences by age
+                    fallback_sentences = {
+                        (2, 3): "Hello there",
+                        (3, 4): "I see you",
+                        (4, 5): "The ball is red",
+                        (5, 6): "I like to play games",
+                        (6, 7): "The big dog runs very fast",
+                        (7, 8): "I went to the park yesterday morning",
+                        (8, 10): "The little bird flew over the tall green tree"
                     }
+                    sentence = fallback_sentences.get((min_words, max_words), "Hello, how are you?")
+                
+            except:
+                sentence = "Hello, how are you?"
+            
+            # Generate audio from the sentence
+            audio_base64 = generate_audio_for_question(sentence)
+            
+            if audio_base64:
+                st.session_state.audio_cache[key] = {
+                    "audio_base64": audio_base64,
+                    "sentence": sentence
+                }
     
     # Display the audio task
+    recorded_audio = None
+    sentence_played = ""
+    
     if key in st.session_state.audio_cache:
         cached = st.session_state.audio_cache[key]
+        sentence_played = cached.get('sentence', '')
         
-        # Show parent instruction
-        st.write(f"**📋 Instructions:** {cached.get('instruction_for_parent', 'Play the audio for the child.')}")
+        # Step 1: Play audio
+        st.markdown("### 🔊 Step 1: Play this audio for the child")
+        st.audio(f"data:audio/mp3;base64,{cached['audio_base64']}", format="audio/mp3")
         
-        col1, col2 = st.columns([1, 1])
+        with st.expander("👁️ See what the child should say"):
+            st.success(f'**"{sentence_played}"**')
         
-        with col1:
-            st.write("**🔊 Step 1: Play this for the child:**")
-            
-            # Show what will be played
-            with st.expander("👁️ See what the child will hear"):
-                st.info(f"*\"{cached.get('audio_text', '')}\"*")
-                st.caption(f"Expected response: {cached.get('expected_response', '')}")
-            
-            # Audio player
-            audio_html = f'''
-            <audio controls style="width: 100%;">
-                <source src="data:audio/mp3;base64,{cached['audio_base64']}" type="audio/mp3">
-            </audio>
-            '''
-            st.markdown(audio_html, unsafe_allow_html=True)
+        st.markdown("---")
         
-        with col2:
-            st.write("**🎤 Step 2: Record child's response:**")
-            recorded_audio = st.audio_input(
-                "Click to record",
-                key=f"{key}_recording"
-            )
+        # Step 2: Record
+        st.markdown("### 🎤 Step 2: Record the child repeating")
+        recorded_audio = st.audio_input("Click to record the child's response", key=f"{key}_recording")
     else:
-        st.warning(f"⚠️ Could not generate audio. Read aloud: *{question}*")
-        col1, col2 = st.columns([1, 1])
-        with col2:
-            recorded_audio = st.audio_input(
-                "Record child's response",
-                key=f"{key}_recording"
-            )
+        st.warning(f"⚠️ Could not generate audio. Please read aloud a simple sentence for the child to repeat.")
+        recorded_audio = st.audio_input("Record the child's response", key=f"{key}_recording")
     
-    # Process recorded audio
+    # Process recording
     transcription = ""
+    ai_assessment = ""
     
     if recorded_audio:
         st.success("✅ Audio recorded!")
         st.audio(recorded_audio, format="audio/wav")
         
-        with st.spinner("🤖 Analyzing child's response..."):
+        with st.spinner("🤖 AI is analyzing the response..."):
             audio_bytes = recorded_audio.getvalue()
             
-            # Get the expected text for comparison
-            expected_text = ""
-            if key in st.session_state.audio_cache:
-                expected_text = st.session_state.audio_cache[key].get('audio_text', '')
-            
-            # Transcribe with context
-            transcription = transcribe_audio_with_gemini(api_key, audio_bytes)
-            
-            if transcription and "Could not" not in transcription:
-                st.write("**📝 What we heard:**")
-                st.info(transcription)
+            # Send to Gemini for analysis
+            try:
+                client = genai.Client(api_key=api_key)
+                audio_base64 = base64.b64encode(audio_bytes).decode()
+                
+                analysis_prompt = f"""Listen to this audio recording of a child.
+The child was asked to repeat: "{sentence_played}"
+
+Analyze:
+1. What did the child actually say? (transcription)
+2. How accurate was the repetition? (accurate/partially accurate/inaccurate/no response)
+3. How clear was the speech? (clear/partially clear/unclear)
+
+Return in this format:
+TRANSCRIPTION: [what the child said]
+ACCURACY: [accurate/partially accurate/inaccurate/no response]  
+CLARITY: [clear/partially clear/unclear]
+NOTES: [any observations about pronunciation, missing words, etc.]"""
+
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=[
+                        {
+                            "parts": [
+                                {"text": analysis_prompt},
+                                {
+                                    "inline_data": {
+                                        "mime_type": "audio/wav",
+                                        "data": audio_base64
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                )
+                ai_assessment = response.text
+                
+                # Extract transcription
+                if "TRANSCRIPTION:" in ai_assessment:
+                    transcription = ai_assessment.split("TRANSCRIPTION:")[1].split("\n")[0].strip()
+                
+            except Exception as e:
+                ai_assessment = f"Could not analyze: {str(e)}"
+        
+        # Show AI analysis
+        st.markdown("### 📊 AI Analysis")
+        st.info(ai_assessment)
     
-    # Rating
-    st.write("**📊 Rate the response:**")
+    st.markdown("---")
+    
+    # Manual rating (backup/override)
+    st.markdown("### ✏️ Your Rating")
     accuracy = st.radio(
-        "How well did the child respond?",
-        options=["No response", "Partial/Unclear", "Mostly accurate", "Fully accurate"],
-        index=2 if recorded_audio else 0,  # Default based on whether audio was recorded
+        "How well did the child repeat?",
+        options=["No response", "Inaccurate", "Partially accurate", "Fully accurate"],
+        index=None,
         key=f"{key}_rating",
         horizontal=True
     )
     
-    score_map = {"No response": 0, "Partial/Unclear": 1, "Mostly accurate": 2, "Fully accurate": 3}
+    score_map = {"No response": 0, "Inaccurate": 1, "Partially accurate": 2, "Fully accurate": 3}
     
-    # Get the actual audio text that was played
-    audio_text_played = ""
-    if key in st.session_state.audio_cache:
-        audio_text_played = st.session_state.audio_cache[key].get('audio_text', '')
+    if accuracy is None:
+        return {
+            "response": None,
+            "score": None,
+            "sentence_played": sentence_played,
+            "transcription": transcription,
+            "ai_assessment": ai_assessment,
+            "has_recording": recorded_audio is not None,
+            "response_type": "audio_instruction"
+        }
     
     return {
         "response": accuracy,
         "score": score_map[accuracy],
+        "sentence_played": sentence_played,
         "transcription": transcription,
-        "audio_played": audio_text_played,
+        "ai_assessment": ai_assessment,
         "has_recording": recorded_audio is not None,
         "response_type": "audio_instruction"
     }
 
 
 def render_visual_question(question: str, key: str, api_key: str) -> Dict:
-    """Render a visual identification question with generated image."""
+    """Render a visual identification question with generated image and clear instructions."""
     
-    st.info("🖼️ **Visual Task**: Show the image to the child and ask them to identify what they see.")
+    # Get child's age from session state
+    child_age = st.session_state.get('child_age_for_questions', '4-5 years')
     
-    # Generate image
+    # Generate image with task-specific details
     if key not in st.session_state.image_cache:
-        with st.spinner("🎨 Generating image for this question... (this may take a moment)"):
+        with st.spinner("🎨 Generating visual task... (this may take a moment)"):
             try:
-                image_data = generate_image_for_question(api_key, question)
+                image_data = generate_image_for_question(api_key, question, child_age)
                 if image_data:
                     st.session_state.image_cache[key] = image_data
                 else:
-                    # Store a marker that we tried but failed
                     st.session_state.image_cache[key] = {"generation_failed": True}
             except Exception as gen_err:
                 st.session_state.image_cache[key] = {"generation_failed": True, "error": str(gen_err)}
+    
+    cached_data = st.session_state.image_cache.get(key, {})
+    
+    # Get task info from cached data
+    task_type = cached_data.get('task_type', 'identification')
+    assessor_instruction = cached_data.get('assessor_instruction', question)
+    
+    # Task type specific instructions
+    task_instructions = {
+        "hidden_object": "🔍 **Hidden Object Task**: Show the image and ask the child to find the hidden item.",
+        "identification": "👆 **Identification Task**: Show the image and ask the child to identify/point to the item.",
+        "counting": "🔢 **Counting Task**: Show the image and ask the child to count the items.",
+        "color_identification": "🎨 **Color Task**: Show the image and ask the child to identify the color.",
+        "shape_identification": "🔷 **Shape Task**: Show the image and ask the child to identify the shapes.",
+        "pointing": "👉 **Pointing Task**: Show the image and ask the child to point to the specified item."
+    }
+    
+    st.info(task_instructions.get(task_type, "🖼️ **Visual Task**: Show the image to the child."))
     
     # Create two columns - image on left, question/response on right
     col_image, col_response = st.columns([1, 1])
     
     # Display the image in left column
     with col_image:
-        if key in st.session_state.image_cache:
-            cached_data = st.session_state.image_cache[key]
+        if cached_data.get("generation_failed"):
+            # Show fallback UI with clear instructions
+            st.warning("⚠️ Image generation unavailable.")
+            st.markdown(f"""
+            <div style="background-color: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ffc107; color: #856404;">
+                <strong style="color: #856404;">📋 Manual Task:</strong><br>
+                {question}<br><br>
+                <em>Please use appropriate visual materials (pictures, objects, cards) to conduct this task.</em>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        elif "image_base64" in cached_data:
+            # Display the generated image
+            st.write("**🖼️ Show this image to the child:**")
             
-            if cached_data.get("generation_failed"):
-                # Show fallback UI
-                st.warning("⚠️ Image generation unavailable.")
-                st.write(f"**Task:** {question}")
-                st.caption("Present appropriate visual materials to the child.")
-            
-            elif "image_base64" in cached_data:
-                # Display actual generated image - compact size
-                st.write("**🖼️ Show to child:**")
-                
+            try:
+                image_bytes = base64.b64decode(cached_data["image_base64"])
+                image = Image.open(io.BytesIO(image_bytes))
+                max_display_width = 280
+                if image.width > max_display_width:
+                    ratio = max_display_width / image.width
+                    new_size = (max_display_width, int(image.height * ratio))
+                    image = image.resize(new_size, Image.Resampling.LANCZOS)
+                st.image(image, width='stretch')
+            except Exception as img_err:
                 try:
-                    # Display using st.image with fixed width
-                    image_bytes = base64.b64decode(cached_data["image_base64"])
-                    image = Image.open(io.BytesIO(image_bytes))
-                    # Resize image if too large (max 300px width for display)
-                    max_display_width = 280
-                    if image.width > max_display_width:
-                        ratio = max_display_width / image.width
-                        new_size = (max_display_width, int(image.height * ratio))
-                        image = image.resize(new_size, Image.Resampling.LANCZOS)
-                    st.image(image, width='content')
-                except Exception as img_err:
-                    # Fallback to HTML img tag with size constraint
-                    try:
-                        image_html = f'<img src="data:image/png;base64,{cached_data["image_base64"]}" style="max-width: 280px; max-height: 280px; border-radius: 8px; border: 2px solid #4a9b8c;">'
-                        st.markdown(image_html, unsafe_allow_html=True)
-                    except:
-                        st.error(f"Could not display image")
-                
-                # Show what to look for
-                st.caption(f"✓ {cached_data.get('correct_answer', 'Ask what they see')[:100]}")
-            
-            elif "text_fallback" in cached_data:
-                # Fallback to text description
-                st.warning("⚠️ Using description instead.")
-                try:
-                    scene_json = cached_data["text_fallback"]
-                    if "```" in scene_json:
-                        scene_json = scene_json.split("```")[1]
-                        if scene_json.startswith("json"):
-                            scene_json = scene_json[4:]
-                    scene_info = json.loads(scene_json.strip())
-                    st.write("**Draw/show:**", scene_info.get("scene_description", "")[:150])
+                    image_html = f'<img src="data:image/png;base64,{cached_data["image_base64"]}" style="max-width: 280px; max-height: 280px; border-radius: 8px; border: 2px solid #4a9b8c;">'
+                    st.markdown(image_html, unsafe_allow_html=True)
                 except:
-                    st.caption("Present visual materials for this question.")
+                    st.error("Could not display image")
+            
+            # Show what to ask the child
+            st.markdown(f"""
+            <div style="background-color: #e3f2fd; padding: 10px; border-radius: 8px; margin-top: 10px; color: #1565c0;">
+                <strong style="color: #1565c0;">🗣️ Ask the child:</strong><br>
+                "{assessor_instruction}"
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Show expected answer in an expander (for assessor reference)
+            with st.expander("👁️ Expected Answer (for assessor)", expanded=False):
+                correct_answer = cached_data.get('correct_answer', 'Identify the item')
+                main_subject = cached_data.get('main_subject', '')
+                st.success(f"**Correct Answer:** {correct_answer}")
+                if main_subject:
+                    st.caption(f"**Looking for:** {main_subject}")
+        
+        elif "text_fallback" in cached_data:
+            st.warning("⚠️ Using description instead of image.")
+            try:
+                scene_json = cached_data["text_fallback"]
+                if "```" in scene_json:
+                    scene_json = scene_json.split("```")[1]
+                    if scene_json.startswith("json"):
+                        scene_json = scene_json[4:]
+                scene_info = json.loads(scene_json.strip())
+                st.markdown(f"""
+                <div style="background-color: #f5f5f5; padding: 15px; border-radius: 8px; color: #333333;">
+                    <strong style="color: #333333;">📋 Scene to create/show:</strong><br>
+                    {scene_info.get("scene_description", "Present visual materials for this question.")}<br><br>
+                    <strong style="color: #333333;">🗣️ Ask:</strong> {scene_info.get("assessor_instruction", question)}
+                </div>
+                """, unsafe_allow_html=True)
+            except:
+                st.caption("Present visual materials for this question.")
         else:
-            st.warning("Could not generate image.")
+            st.warning("Could not generate image. Please use physical materials.")
     
     # Child's response in right column
     with col_response:
         st.write("**👶 Child's Response:**")
+        
+        # Radio buttons with no default selection
         response = st.radio(
             "What did the child identify?",
             options=["Correct identification", "Partially correct", "Incorrect", "No response"],
             key=key,
+            index=None,  # No default selection
             horizontal=False
         )
         
         details = st.text_input(
             "What did the child say/point to:",
             key=f"{key}_details",
-            placeholder="e.g., 'Pointed to the red ball'"
+            placeholder="e.g., 'Pointed to the red ball', 'Said: behind the chair'"
         )
+        
+        # Show scoring guide
+        with st.expander("📊 Scoring Guide"):
+            st.markdown("""
+            - **Correct identification (3 pts)**: Child correctly identified/found the item
+            - **Partially correct (2 pts)**: Child was close but not exact (e.g., wrong color, approximate location)
+            - **Incorrect (1 pt)**: Child pointed to wrong item or gave wrong answer
+            - **No response (0 pts)**: Child did not respond or refused to participate
+            """)
     
     score_map = {"Correct identification": 3, "Partially correct": 2, "Incorrect": 1, "No response": 0}
     
+    # Handle None response
+    if response is None:
+        return {
+            "response": None,
+            "score": None,
+            "details": details,
+            "response_type": "visual_identification",
+            "task_type": task_type,
+            "expected_answer": cached_data.get('correct_answer', '')
+        }
+    
     return {
         "response": response,
-        "score": score_map[response],
+        "score": score_map.get(response, 0),
         "details": details,
-        "response_type": "visual_identification"
+        "response_type": "visual_identification",
+        "task_type": task_type,
+        "expected_answer": cached_data.get('correct_answer', '')
     }
 
 
@@ -1288,7 +1686,7 @@ def render_motor_task_question(question: str, key: str) -> Dict:
     response = st.radio(
         "Skill level observed",
         options=list(MOTOR_SKILL_SCALE.keys()),
-        index=3,  # Default to "Does with minor difficulty"
+        index=None,  # No default selection - user must choose
         key=key,
         horizontal=True
     )
@@ -1300,7 +1698,7 @@ def render_motor_task_question(question: str, key: str) -> Dict:
         consistency = st.radio(
             "Consistency",
             options=["Inconsistent", "Variable", "Mostly consistent", "Very consistent"],
-            index=2,  # Default to "Mostly consistent"
+            index=None,  # No default selection - user must choose
             key=f"{key}_consistency",
             horizontal=True
         )
@@ -1310,6 +1708,17 @@ def render_motor_task_question(question: str, key: str) -> Dict:
         key=f"{key}_notes",
         placeholder="e.g., 'Good balance, slight wobble on left foot'"
     )
+    
+    # Handle None response (not yet answered)
+    if response is None:
+        return {
+            "response": None,
+            "score": None,
+            "attempts": attempts,
+            "consistency": consistency,
+            "notes": notes,
+            "response_type": "motor_task"
+        }
     
     return {
         "response": response,
@@ -1327,6 +1736,7 @@ def render_yes_no_question(question: str, key: str) -> Dict:
     response = st.radio(
         "Response",
         options=list(YES_NO_SCALE.keys()),
+        index=None,  # No default selection - user must choose
         key=key,
         horizontal=True
     )
@@ -1338,6 +1748,15 @@ def render_yes_no_question(question: str, key: str) -> Dict:
             key=f"{key}_details",
             placeholder="When or how often?"
         )
+    
+    # Handle None response (not yet answered)
+    if response is None:
+        return {
+            "response": None,
+            "score": None,
+            "details": details,
+            "response_type": "yes_no"
+        }
     
     return {
         "response": response,
@@ -1362,6 +1781,9 @@ def render_preference_question(question: str, key: str) -> Dict:
     elif any(word in question_lower for word in ['read', 'write', 'text', 'book', 'reading', 'writing']):
         learning_modality = "Reading/Writing"
     
+    # Check if question involves resources that may not be available (audiobooks, podcasts, etc.)
+    requires_resource_access = any(word in question_lower for word in ['audiobook', 'podcast', 'audio book', 'e-book', 'ebook', 'tablet', 'computer', 'app'])
+    
     modality_colors = {
         "Auditory": "#e3f2fd",
         "Visual": "#e8f5e9", 
@@ -1370,31 +1792,55 @@ def render_preference_question(question: str, key: str) -> Dict:
         "General": "#f5f5f5"
     }
     
+    modality_text_colors = {
+        "Auditory": "#1565c0",
+        "Visual": "#2e7d32", 
+        "Kinesthetic": "#ef6c00",
+        "Reading/Writing": "#7b1fa2",
+        "General": "#333333"
+    }
+    
     st.markdown(f"""
     <div style="background-color: {modality_colors.get(learning_modality, '#f5f5f5')}; 
                 padding: 0.5rem 1rem; border-radius: 8px; margin-bottom: 0.5rem;
-                display: inline-block;">
+                display: inline-block; color: {modality_text_colors.get(learning_modality, '#333333')};">
         <span style="font-weight: 600;">🎯 Learning Style: {learning_modality}</span>
     </div>
     """, unsafe_allow_html=True)
     
     st.info("💡 **Learning Preference**: Rate how strongly this describes the child.")
     
+    # Add "Not applicable" option for questions requiring specific resource access
+    if requires_resource_access:
+        options = ["Not applicable / No access", "Not at all", "A little", "Somewhat", "Quite a bit", "Very much"]
+        score_map = {"Not applicable / No access": None, "Not at all": 0, "A little": 1, "Somewhat": 2, "Quite a bit": 3, "Very much": 4}
+    else:
+        options = ["Not at all", "A little", "Somewhat", "Quite a bit", "Very much"]
+        score_map = {"Not at all": 0, "A little": 1, "Somewhat": 2, "Quite a bit": 3, "Very much": 4}
+    
     response = st.radio(
         "How well does this describe the child?",
-        options=["Not at all", "A little", "Somewhat", "Quite a bit", "Very much"],
-        index=2,  # Default to "Somewhat"
+        options=options,
+        index=None,  # No default selection - user must choose
         key=key,
         horizontal=True
     )
     
-    score_map = {"Not at all": 0, "A little": 1, "Somewhat": 2, "Quite a bit": 3, "Very much": 4}
+    # Handle None response (not yet answered)
+    if response is None:
+        return {
+            "response": None,
+            "score": None,
+            "response_type": "preference",
+            "learning_modality": learning_modality
+        }
     
     return {
         "response": response,
-        "score": score_map[response],
+        "score": score_map.get(response),
         "response_type": "preference",
-        "learning_modality": learning_modality
+        "learning_modality": learning_modality,
+        "not_applicable": response == "Not applicable / No access"
     }
 
 
@@ -1404,11 +1850,19 @@ def render_observation_question(question: str, key: str) -> Dict:
     response = st.radio(
         "Your observation",
         options=list(LIKERT_SCALE.keys()),
-        index=2,  # Default to "Sometimes"
+        index=None,  # No default selection - user must choose
         key=key,
         horizontal=True,
         label_visibility="collapsed"
     )
+    
+    # Handle None response (not yet answered)
+    if response is None:
+        return {
+            "response": None,
+            "score": None,
+            "response_type": "observation"
+        }
     
     return {
         "response": response,
@@ -1429,7 +1883,7 @@ def render_question(q_data: Dict, index: int, section_key: str, api_key: str) ->
     
     renderers = {
         "frequency_likert": lambda: render_likert_question(question, key),
-        "short_answer": lambda: render_short_answer_question(question, key),
+        "short_answer": lambda: render_short_answer_question(question, key, api_key),
         "audio_instruction": lambda: render_audio_instruction_question(question, key, api_key),
         "visual_identification": lambda: render_visual_question(question, key, api_key),
         "motor_task": lambda: render_motor_task_question(question, key),
@@ -1448,7 +1902,7 @@ def render_question(q_data: Dict, index: int, section_key: str, api_key: str) ->
 
 
 def render_question_section(section_name: str, questions: List[Dict], section_key: str, api_key: str):
-    """Render questions for a specific section."""
+    """Render questions for a specific section with step-by-step navigation."""
     st.subheader(f"📝 {section_name} Assessment")
     
     # Show question type summary
@@ -1461,20 +1915,154 @@ def render_question_section(section_name: str, questions: List[Dict], section_ke
         type_summary = " • ".join([f"{k.replace('_', ' ').title()}: {v}" for k, v in type_counts.items()])
         st.caption(f"📋 {type_summary}")
     
-    st.markdown("---")
-    
     if not questions:
         st.warning(f"No questions available for {section_name}.")
         return []
     
-    responses = []
-    for i, q_data in enumerate(questions):
-        with st.container():
-            response = render_question(q_data, i, section_key, api_key)
-            responses.append(response)
-            st.markdown("---")
+    # Initialize current question index in session state for this section
+    current_q_key = f"{section_key}_current_question"
+    if current_q_key not in st.session_state:
+        st.session_state[current_q_key] = 0
     
-    return responses
+    current_idx = st.session_state[current_q_key]
+    total_questions = len(questions)
+    
+    # Progress indicator for this section
+    st.progress((current_idx + 1) / total_questions, text=f"Question {current_idx + 1} of {total_questions}")
+    
+    st.markdown("---")
+    
+    # Collect all responses (needed for final submission)
+    responses = []
+    
+    # Show only the current question
+    if current_idx < total_questions:
+        q_data = questions[current_idx]
+        
+        with st.container():
+            response = render_question(q_data, current_idx, section_key, api_key)
+            responses.append(response)
+        
+        st.markdown("---")
+        
+        # Navigation buttons
+        col1, col2, col3 = st.columns([1, 2, 1])
+        
+        with col1:
+            # Previous button
+            if current_idx > 0:
+                if st.button("⬅️ Previous", key=f"{section_key}_prev", width='stretch'):
+                    st.session_state[current_q_key] = current_idx - 1
+                    st.rerun()
+        
+        with col3:
+            # Next button or Complete Section button
+            if current_idx < total_questions - 1:
+                # Check if current question is answered
+                is_answered = response.get('response') is not None
+                
+                if st.button(
+                    "Next ➡️", 
+                    key=f"{section_key}_next", 
+                    width='stretch',
+                    disabled=not is_answered,
+                    help="Please answer this question before proceeding" if not is_answered else "Go to next question"
+                ):
+                    st.session_state[current_q_key] = current_idx + 1
+                    st.rerun()
+            else:
+                # Last question - show complete section message
+                is_answered = response.get('response') is not None
+                if is_answered:
+                    st.success("✅ Section complete! Move to next tab.")
+                else:
+                    st.warning("⚠️ Please answer this question.")
+    
+    # Collect all responses for this section (for final assessment)
+    # We need to get all responses, not just current one
+    all_section_responses = []
+    for i, q_data in enumerate(questions):
+        key = f"{section_key}_q{i}"
+        # Try to get saved response from session state
+        saved_response = get_saved_response(q_data, i, section_key)
+        all_section_responses.append(saved_response)
+    
+    return all_section_responses
+
+
+def get_saved_response(q_data: Dict, index: int, section_key: str) -> Dict:
+    """Get the saved response for a question from session state."""
+    question = q_data['question']
+    q_type = q_data['question_type']
+    tags = q_data.get('tags', [])
+    key = f"{section_key}_q{index}"
+    
+    # Get response value from session state
+    response_value = st.session_state.get(key)
+    
+    # Build response dict based on question type
+    base_response = {
+        "question": question,
+        "question_type": q_type,
+        "tags": tags,
+        "response": response_value
+    }
+    
+    if q_type == "frequency_likert" or q_type == "observation":
+        base_response["score"] = LIKERT_SCALE.get(response_value) if response_value else None
+        base_response["response_type"] = "likert" if q_type == "frequency_likert" else "observation"
+    elif q_type == "motor_task":
+        base_response["score"] = MOTOR_SKILL_SCALE.get(response_value) if response_value else None
+        base_response["attempts"] = st.session_state.get(f"{key}_attempts", 1)
+        base_response["consistency"] = st.session_state.get(f"{key}_consistency")
+        base_response["notes"] = st.session_state.get(f"{key}_notes", "")
+        base_response["response_type"] = "motor_task"
+    elif q_type == "yes_no":
+        base_response["score"] = YES_NO_SCALE.get(response_value) if response_value else None
+        base_response["details"] = st.session_state.get(f"{key}_details", "")
+        base_response["response_type"] = "yes_no"
+    elif q_type == "preference":
+        score_map = {"Not applicable / No access": None, "Not at all": 0, "A little": 1, "Somewhat": 2, "Quite a bit": 3, "Very much": 4}
+        base_response["score"] = score_map.get(response_value) if response_value else None
+        base_response["response_type"] = "preference"
+        base_response["not_applicable"] = response_value == "Not applicable / No access"
+    elif q_type == "short_answer":
+        quality = st.session_state.get(f"{key}_quality")
+        score_map = {"No response": 0, "Unclear/Off-topic": 1, "Partially correct": 2, "Correct": 3}
+        base_response["quality"] = quality
+        base_response["score"] = score_map.get(quality) if quality else None
+        base_response["response_type"] = "short_answer"
+        # Include story data if it was generated for comprehension questions
+        story_cache_key = f"{key}_story"
+        if story_cache_key in st.session_state:
+            story_data = st.session_state[story_cache_key]
+            base_response["story_shown"] = story_data.get('story_text', '')
+            base_response["expected_answers"] = story_data.get('correct_answers', {})
+    elif q_type == "audio_instruction":
+        rating = st.session_state.get(f"{key}_rating")
+        score_map = {"No response": 0, "Inaccurate": 1, "Partially accurate": 2, "Fully accurate": 3}
+        base_response["response"] = rating
+        base_response["score"] = score_map.get(rating) if rating else None
+        base_response["response_type"] = "audio_instruction"
+        # Include audio task data if available
+        if key in st.session_state.get('audio_cache', {}):
+            audio_data = st.session_state.audio_cache[key]
+            base_response["sentence_played"] = audio_data.get('sentence', '')
+    elif q_type == "visual_identification":
+        score_map = {"Correct identification": 3, "Partially correct": 2, "Incorrect": 1, "No response": 0}
+        base_response["score"] = score_map.get(response_value) if response_value else None
+        base_response["details"] = st.session_state.get(f"{key}_details", "")
+        base_response["response_type"] = "visual_identification"
+        # Include image task data if available
+        if key in st.session_state.get('image_cache', {}):
+            image_data = st.session_state.image_cache[key]
+            base_response["task_type"] = image_data.get('task_type', 'identification')
+            base_response["expected_answer"] = image_data.get('correct_answer', '')
+    else:
+        base_response["score"] = LIKERT_SCALE.get(response_value) if response_value else None
+        base_response["response_type"] = "observation"
+    
+    return base_response
 
 
 def check_all_questions_answered(all_responses: Dict[str, List[Dict]]) -> Tuple[bool, int, int, List[str]]:
@@ -1493,19 +2081,44 @@ def check_all_questions_answered(all_responses: Dict[str, List[Dict]]) -> Tuple[
         for resp in responses:
             total_questions += 1
             response_value = resp.get('response')
+            response_type = resp.get('response_type', '')
             
-            # Check if question has a valid response
-            if response_value is not None and str(response_value).strip() != '':
-                # For text responses, check they're not empty
-                if resp.get('response_type') == 'short_answer':
-                    if resp.get('quality') and resp.get('quality') != 'No response':
-                        section_answered += 1
-                        answered_questions += 1
-                elif resp.get('response_type') == 'audio_instruction':
-                    if resp.get('response') and resp.get('response') != 'No response':
-                        section_answered += 1
-                        answered_questions += 1
-                else:
+            # Check based on question type
+            if response_type == 'short_answer':
+                # For short answer, check if quality rating was selected (including "No response")
+                quality = resp.get('quality')
+                if quality is not None:  # User selected something (even "No response" is valid)
+                    section_answered += 1
+                    answered_questions += 1
+                    
+            elif response_type == 'audio_instruction':
+                # For audio, check if rating was selected (including "No response")
+                # response_value holds the rating selection
+                if response_value is not None:  # User selected something
+                    section_answered += 1
+                    answered_questions += 1
+                    
+            elif response_type == 'visual_identification':
+                # For visual tasks, check if identification was selected
+                if response_value is not None:
+                    section_answered += 1
+                    answered_questions += 1
+                    
+            elif response_type == 'motor_task':
+                # For motor tasks, check if skill level was selected
+                if response_value is not None:
+                    section_answered += 1
+                    answered_questions += 1
+                    
+            elif response_type == 'preference':
+                # For preference, any selection is valid (including "Not applicable")
+                if response_value is not None:
+                    section_answered += 1
+                    answered_questions += 1
+                    
+            else:
+                # For likert, yes_no, observation - check if response selected
+                if response_value is not None and str(response_value).strip() != '':
                     section_answered += 1
                     answered_questions += 1
         
@@ -2087,7 +2700,7 @@ def render_visual_report(child_name: str, child_age: str, all_responses: Dict[st
     # Row 3: Learning Preferences breakdown (Auditory, Visual, Kinesthetic)
     st.markdown("#### 📚 Learning Style Breakdown")
     learning_prefs_chart = create_learning_preferences_chart(all_responses)
-    st.plotly_chart(learning_prefs_chart, use_container_width=True)
+    st.plotly_chart(learning_prefs_chart, width='stretch')
     
     # Show learning style summary
     modality_data = analyze_learning_preferences(all_responses)
@@ -2311,11 +2924,12 @@ Clinical Tags: {', '.join(tags) if tags else 'General developmental'}
             
             # Audio task specific analysis
             if q_type == 'audio_instruction':
-                if resp.get('audio_played'):
-                    prompt += f"   📢 Auditory Stimulus Given: \"{resp['audio_played']}\"\n"
+                if resp.get('sentence_played'):
+                    prompt += f"   📢 Sentence to Repeat: \"{resp['sentence_played']}\"\n"
                 if resp.get('transcription'):
-                    prompt += f"   🗣️ Child's Verbal Response: {resp['transcription']}\n"
-                    prompt += f"   📊 Compare stimulus vs response for auditory processing assessment\n"
+                    prompt += f"   🗣️ Child's Repetition: {resp['transcription']}\n"
+                if resp.get('ai_assessment'):
+                    prompt += f"   🤖 AI Analysis: {resp['ai_assessment'][:200]}...\n"
                 if resp.get('has_recording'):
                     prompt += f"   🎙️ Audio Recording: Available\n"
             
@@ -2627,7 +3241,7 @@ def main():
             all_responses[section_name] = responses
     
     st.markdown("---")
-    st.markdown("### 📊 Generate Assessment")
+    st.markdown("### 📊 Submit Assessment")
     
     # Check if all questions are answered
     all_answered, answered_count, total_count, missing_sections = check_all_questions_answered(all_responses)
@@ -2650,11 +3264,14 @@ def main():
     if validation_errors:
         for error in validation_errors:
             st.warning(f"⚠️ {error}")
+    else:
+        st.success("✅ All questions answered! Ready to submit.")
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         generate_button = st.button(
-            "🎯 Generate Assessment Report", 
+            "📤 Submit & Generate Report", 
+            type="primary",
             width='stretch', 
             disabled=bool(validation_errors),
             help="Complete all questions in every section to enable this button"
